@@ -39,6 +39,9 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <asm/unaligned.h>
+#ifdef CONFIG_ARM64
+#include "lz4armv8/lz4accel.h"
+#endif
 
 /*-*****************************
  *	Decompression functions
@@ -57,9 +60,15 @@
  * Note that it is important for performance that this function really get inlined,
  * in order to remove useless branches during compilation optimization.
  */
-static FORCE_INLINE int LZ4_decompress_generic(
+/*
+ * Decode from the current pointers while keeping bounds and return values
+ * relative to the beginning of the original block.
+ */
+static FORCE_INLINE int LZ4_decompress_generic_continue(
 	 const char * const src,
 	 char * const dst,
+	 const char * const srcPtr,
+	 char * const dstPtr,
 	 int srcSize,
 		/*
 		 * If endOnInput == endOnInputSize,
@@ -80,11 +89,11 @@ static FORCE_INLINE int LZ4_decompress_generic(
 	 const size_t dictSize
 	 )
 {
-	const BYTE *ip = (const BYTE *) src;
-	const BYTE * const iend = ip + srcSize;
+	const BYTE *ip = (const BYTE *) srcPtr;
+	const BYTE * const iend = (const BYTE *)src + srcSize;
 
-	BYTE *op = (BYTE *) dst;
-	BYTE * const oend = op + outputSize;
+	BYTE *op = (BYTE *)dstPtr;
+	BYTE * const oend = (BYTE *)dst + outputSize;
 	BYTE *cpy;
 
 	const BYTE * const dictEnd = (const BYTE *)dictStart + dictSize;
@@ -457,9 +466,52 @@ _output_error:
 	return (int) (-(((const char *)ip) - src)) - 1;
 }
 
+static FORCE_INLINE int LZ4_decompress_generic(
+	 const char * const src,
+	 char * const dst,
+	 int srcSize,
+	 int outputSize,
+	 endCondition_directive endOnInput,
+	 earlyEnd_directive partialDecoding,
+	 dict_directive dict,
+	 const BYTE * const lowPrefix,
+	 const BYTE * const dictStart,
+	 const size_t dictSize)
+{
+	return LZ4_decompress_generic_continue(src, dst, src, dst, srcSize,
+					       outputSize, endOnInput,
+					       partialDecoding, dict,
+					       lowPrefix, dictStart,
+					       dictSize);
+}
+
 int LZ4_decompress_safe(const char *source, char *dest,
 	int compressedSize, int maxDecompressedSize)
 {
+#ifdef __ARCH_HAS_LZ4_ACCELERATOR
+	const uint8_t *srcPtr = (const uint8_t *)source;
+	uint8_t *dstPtr = (uint8_t *)dest;
+
+	if (compressedSize > LZ4_FAST_MARGIN &&
+	    maxDecompressedSize > LZ4_FAST_MARGIN &&
+	    lz4_decompress_accel_enable()) {
+		int ret;
+
+		ret = lz4_decompress_asm(&dstPtr, (uint8_t *)dest,
+			(uint8_t *)dest + maxDecompressedSize -
+			LZ4_FAST_MARGIN, &srcPtr,
+			(const uint8_t *)source + compressedSize -
+			LZ4_FAST_MARGIN, false);
+		if (!ret)
+			return LZ4_decompress_generic_continue(source, dest,
+				(const char *)srcPtr, (char *)dstPtr,
+				compressedSize, maxDecompressedSize,
+				endOnInputSize, decode_full_block, noDict,
+				(BYTE *)dest, NULL, 0);
+		/* The safe C path restarts from the block start after ASM failure. */
+	}
+#endif
+
 	return LZ4_decompress_generic(source, dest,
 				      compressedSize, maxDecompressedSize,
 				      endOnInputSize, decode_full_block,
