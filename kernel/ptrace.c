@@ -246,7 +246,6 @@ static void ptrace_unfreeze_traced(struct task_struct *task)
 static int ptrace_check_attach(struct task_struct *child, bool ignore_state)
 {
 	int ret = -ESRCH;
-	child->ptrace_message = 0;
 
 	/*
 	 * We take the read lock around doing both checks to close a
@@ -618,7 +617,7 @@ static int ptrace_detach(struct task_struct *child, unsigned int data)
 
 	/* Reset ptrace_message to avoid stale PID leaks */
 	child->ptrace_message = 0;
-	
+
 	__ptrace_detach(current, child);
 	write_unlock_irq(&tasklist_lock);
 
@@ -913,13 +912,11 @@ static int ptrace_resume(struct task_struct *child, long request,
 	if (need_siglock)
 		spin_lock_irq(&child->sighand->siglock);
 	child->exit_code = data;
+	child->ptrace_message = 0;
 	wake_up_state(child, __TASK_TRACED);
 	if (need_siglock)
 		spin_unlock_irq(&child->sighand->siglock);
 
-	/* Clear ptrace_message to avoid leaking stale event data (e.g., zygote PID) */
-	child->ptrace_message = 0;
-	
 	return 0;
 }
 
