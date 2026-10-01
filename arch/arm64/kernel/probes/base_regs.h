@@ -46,11 +46,9 @@
 	.endm
 
 	.macro  restore_all_base_regs trampoline = 0
-	.if \trampoline == 0
 	ldr x0, [sp, #S_PSTATE]
 	and x0, x0, #(PSR_N_BIT | PSR_Z_BIT | PSR_C_BIT | PSR_V_BIT)
 	msr nzcv, x0
-	.endif
 
 	ldp x0, x1, [sp, #S_X0]
 	ldp x2, x3, [sp, #S_X2]
