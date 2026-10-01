@@ -5,8 +5,12 @@
 // Copyright (C) 2021, Unisoc Inc.
 // Author: Janet Liu <janet.liu@unisoc.com>
 #include <linux/kprobes.h>
+#include <linux/bitmap.h>
 #include <linux/jump_label.h>
+#include <linux/printk.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
+#include <asm/debug-monitors.h>
 #include <asm/patching.h>
 #include <asm/ptrace.h>
 #include <asm/kprobes.h>
@@ -27,22 +31,51 @@
 	- (kprobe_opcode_t *)&optprobe_template_entry)
 
 
-#define MAX_OPTINSN_PAGES 16  /* 64KB / 4KB(PAGE_SIZE) = 16页 */
-static int optinsn_pages_allocated = 0;
+#define OPTINSN_POOL_SIZE SZ_64K
+#define OPTINSN_PAGE_SIZE SZ_4K
+#define MAX_OPTINSN_PAGES (OPTINSN_POOL_SIZE / OPTINSN_PAGE_SIZE)
+static DECLARE_BITMAP(optinsn_pages_used, MAX_OPTINSN_PAGES);
 
 void *alloc_optinsn_page(void)
 {
-    /* 如果已经分配了超过16页，就停止分配 */
-	if (optinsn_pages_allocated >= MAX_OPTINSN_PAGES)
+	unsigned int idx;
+
+	/* The assembly pool and the generic cache both use 4K pages. */
+	if (PAGE_SIZE != OPTINSN_PAGE_SIZE)
 		return NULL;
 
-    /* 每次返回 &optinsn_slot 起始地址 + 偏移量 */
-	return (void *)((unsigned long)&optinsn_slot + (optinsn_pages_allocated++ * PAGE_SIZE));
+	idx = find_first_zero_bit(optinsn_pages_used, MAX_OPTINSN_PAGES);
+	if (idx >= MAX_OPTINSN_PAGES)
+		return NULL;
+
+	__set_bit(idx, optinsn_pages_used);
+	return (void *)((unsigned long)&optinsn_slot + idx * OPTINSN_PAGE_SIZE);
 }
 
-void free_optinsn_page(void *page __maybe_unused)
+void free_optinsn_page(void *page)
 {
-	return;
+	unsigned long base = (unsigned long)&optinsn_slot;
+	unsigned long addr = (unsigned long)page;
+	unsigned long offset;
+	unsigned int idx;
+
+	/* No slots can have been allocated in non-4K PAGE_SIZE configs. */
+	if (PAGE_SIZE != OPTINSN_PAGE_SIZE)
+		return;
+
+	if (WARN_ON_ONCE(!page || addr < base ||
+			 addr - base >= OPTINSN_POOL_SIZE))
+		return;
+
+	offset = addr - base;
+	if (WARN_ON_ONCE(offset & (OPTINSN_PAGE_SIZE - 1)))
+		return;
+
+	idx = offset / OPTINSN_PAGE_SIZE;
+	if (WARN_ON_ONCE(!test_bit(idx, optinsn_pages_used)))
+		return;
+
+	__clear_bit(idx, optinsn_pages_used);
 }
 
 int arch_prepared_optinsn(struct arch_optimized_insn *optinsn)
@@ -118,9 +151,29 @@ int arch_prepare_optimized_kprobe(struct optimized_kprobe *op, struct kprobe *or
 	kprobe_opcode_t final_branch;
 	u32 insns[8];
 	int i;
+	int ret;
+	int ptr_words = sizeof(unsigned long) / sizeof(insns[0]);
+	int tail_size;
 
 	if (!can_optimize(orig))
 		return -EILSEQ;
+
+	tail_size = TMPL_END_IDX - TMPL_RESTORE_ORIGN_INSN;
+	/* Keep the variable writes and tail patch within insns[]. */
+	if (MAX_OPTINSN_SIZE <= 0 ||
+	    TMPL_RESTORE_ORIGN_INSN <= 0 ||
+	    TMPL_END_IDX <= TMPL_RESTORE_ORIGN_INSN ||
+	    TMPL_END_IDX > MAX_OPTINSN_SIZE ||
+	    tail_size > (int)(sizeof(insns) / sizeof(insns[0])) ||
+	    TMPL_RESTORE_END != TMPL_RESTORE_ORIGN_INSN + 1 ||
+	    TMPL_VAL_IDX != TMPL_RESTORE_END + 1 ||
+	    TMPL_CALL_IDX != TMPL_VAL_IDX + ptr_words ||
+	    TMPL_END_IDX != TMPL_CALL_IDX + ptr_words ||
+	    TMPL_VAL_IDX < TMPL_RESTORE_ORIGN_INSN ||
+	    TMPL_CALL_IDX < TMPL_RESTORE_ORIGN_INSN ||
+	    TMPL_VAL_IDX + ptr_words > TMPL_END_IDX ||
+	    TMPL_CALL_IDX + ptr_words > TMPL_END_IDX)
+		return -EINVAL;
 
 	/* Allocate instruction slot */
 	code = get_optinsn_slot();
@@ -139,18 +192,25 @@ int arch_prepare_optimized_kprobe(struct optimized_kprobe *op, struct kprobe *or
 
 	if (offset > 0x7ffffffL || offset < -0x8000000 || offset & 0x3) {
 
-		free_optinsn_slot(code, 0);
-		return -ERANGE;
+		ret = -ERANGE;
+		goto err_free_code;
 	}
 
 	addrs = kmalloc(MAX_OPTINSN_SIZE * sizeof(kprobe_opcode_t *), GFP_KERNEL);
+	if (!addrs) {
+		ret = -ENOMEM;
+		goto err_free_code;
+	}
+
 	for (i = 0; i < MAX_OPTINSN_SIZE; i++)
 		addrs[i] = &code[i];
 
 	/* Copy arch-dep-instance from template. */
-	aarch64_insn_patch_text(addrs,
-				(kprobe_opcode_t *)&optprobe_template_entry,
-				TMPL_RESTORE_ORIGN_INSN);
+	ret = aarch64_insn_patch_text(addrs,
+				      (kprobe_opcode_t *)&optprobe_template_entry,
+				      TMPL_RESTORE_ORIGN_INSN);
+	if (ret)
+		goto err_free_addrs;
 
 	/* Set probe information */
 	*(unsigned long *)&insns[TMPL_VAL_IDX-TMPL_RESTORE_ORIGN_INSN] = (unsigned long)op;
@@ -162,6 +222,10 @@ int arch_prepare_optimized_kprobe(struct optimized_kprobe *op, struct kprobe *or
 	final_branch = aarch64_insn_gen_branch_imm((unsigned long)(&code[TMPL_RESTORE_END]),
 						   (unsigned long)(op->kp.addr) + 4,
 						   AARCH64_INSN_BRANCH_NOLINK);
+	if (final_branch == AARCH64_BREAK_FAULT) {
+		ret = -ERANGE;
+		goto err_free_addrs;
+	}
 
 	/* The original probed instruction */
 	if (orig->ainsn.api.insn)
@@ -172,9 +236,11 @@ int arch_prepare_optimized_kprobe(struct optimized_kprobe *op, struct kprobe *or
 	/* Jump back to next instruction */
 	insns[1] = final_branch;
 
-	aarch64_insn_patch_text(addrs + TMPL_RESTORE_ORIGN_INSN,
-				insns,
-				TMPL_END_IDX - TMPL_RESTORE_ORIGN_INSN);
+	ret = aarch64_insn_patch_text(addrs + TMPL_RESTORE_ORIGN_INSN,
+				      insns,
+				      TMPL_END_IDX - TMPL_RESTORE_ORIGN_INSN);
+	if (ret)
+		goto err_free_addrs;
 
 	flush_icache_range((unsigned long)code, (unsigned long)(&code[TMPL_END_IDX]));
 
@@ -184,6 +250,12 @@ int arch_prepare_optimized_kprobe(struct optimized_kprobe *op, struct kprobe *or
 	kfree(addrs);
 
 	return 0;
+
+err_free_addrs:
+	kfree(addrs);
+err_free_code:
+	free_optinsn_slot(code, 0);
+	return ret;
 }
 
 void __kprobes arch_optimize_kprobes(struct list_head *oplist)
@@ -194,6 +266,9 @@ void __kprobes arch_optimize_kprobes(struct list_head *oplist)
 		unsigned long insn;
 		void *addrs[] = {0};
 		u32 insns[] = {0};
+		int ret;
+		u32 current_insn;
+		int read_ret;
 
 		WARN_ON(kprobe_disabled(&op->kp));
 
@@ -207,11 +282,47 @@ void __kprobes arch_optimize_kprobes(struct list_head *oplist)
 		insn = aarch64_insn_gen_branch_imm((unsigned long)op->kp.addr,
 						   (unsigned long)op->optinsn.insn,
 						   AARCH64_INSN_BRANCH_NOLINK);
+		if (insn == AARCH64_BREAK_FAULT) {
+			pr_err_ratelimited("Failed to generate optimized branch for kprobe at %p\n",
+					   op->kp.addr);
+			list_del_init(&op->list);
+			op->kp.flags &= ~KPROBE_FLAG_OPTIMIZED;
+			__arch_remove_optimized_kprobe(op, 0);
+			continue;
+		}
 
 		insns[0] = insn;
 		addrs[0] = op->kp.addr;
 
-		aarch64_insn_patch_text(addrs, insns, 1);
+		ret = aarch64_insn_patch_text(addrs, insns, 1);
+		if (ret) {
+			read_ret = aarch64_insn_read(op->kp.addr, &current_insn);
+			list_del_init(&op->list);
+			if (!read_ret && current_insn == insn) {
+				/* The branch landed despite the reported patch error. */
+				flush_icache_range((unsigned long)op->kp.addr,
+						   (unsigned long)op->kp.addr +
+						   AARCH64_INSN_SIZE);
+				pr_err_ratelimited("Kprobe branch patch reported %d after installing at %p\n",
+						   ret, op->kp.addr);
+				continue;
+			}
+
+			if (!read_ret && current_insn == BRK64_OPCODE_KPROBES) {
+				/* The regular breakpoint remains armed; release unused code. */
+				op->kp.flags &= ~KPROBE_FLAG_OPTIMIZED;
+				__arch_remove_optimized_kprobe(op, 0);
+			} else if (read_ret) {
+				/* Preserve optimized state so teardown synchronizes before freeing. */
+				pr_err_ratelimited("Failed to patch kprobe at %p (%d); text read failed (%d), keeping optprobe state\n",
+						   op->kp.addr, ret, read_ret);
+			} else {
+				/* Keep the slot and optimized state until the site is unoptimized. */
+				pr_err_ratelimited("Failed to patch kprobe at %p (%d); unexpected instruction %#x, keeping optprobe state\n",
+						   op->kp.addr, ret, current_insn);
+			}
+			continue;
+		}
 
 		list_del_init(&op->list);
 	}
