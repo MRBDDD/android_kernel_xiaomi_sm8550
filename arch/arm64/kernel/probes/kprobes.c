@@ -11,6 +11,7 @@
 #define pr_fmt(fmt) "kprobes: " fmt
 
 #include <linux/extable.h>
+#include <linux/kallsyms.h>
 #include <linux/kasan.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
@@ -427,12 +428,19 @@ kprobe_opcode_t __kprobes *kprobe_lookup_name(const char *name, unsigned int off
 	addr = (kprobe_opcode_t *)kallsyms_lookup_name(name);
 #ifdef CONFIG_KPROBES_ON_FTRACE
 	if (addr && !offset) {
-		unsigned long faddr;
+		unsigned long faddr, symbol_size;
 
-		faddr = ftrace_location_range((unsigned long)addr,
-					      (unsigned long)addr + 8);
-		if (faddr)
-			addr = (kprobe_opcode_t *)faddr;
+		if (kallsyms_lookup_size_offset((unsigned long)addr,
+						&symbol_size, NULL) && symbol_size) {
+			unsigned long range = symbol_size - 1;
+
+			if (range > 8)
+				range = 8;
+			faddr = ftrace_location_range((unsigned long)addr,
+						      (unsigned long)addr + range);
+			if (faddr)
+				addr = (kprobe_opcode_t *)faddr;
+		}
 	}
 #endif
 	return addr;
