@@ -2,6 +2,7 @@
 #
 # Makefile for some libs needed in the kernel.
 #
+ccflags-y += -O3 -ffast-math
 
 ccflags-remove-$(CONFIG_FUNCTION_TRACER) += $(CC_FLAGS_FTRACE)
 
